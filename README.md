@@ -6,7 +6,10 @@ A lightweight Python desktop app that displays a monthly calendar and marks reco
 - Monthly calendar view with charging days highlighted.
 - Click any day to inspect charging window and energy estimate.
 - In-app chat box to add manual trips in natural language.
+- Home location input in the planner panel for trip context.
+- Chat log shows raw TinyLlama output for transparency/debugging.
 - Adjustable planning inputs:
+  - Home location
   - Battery capacity
   - Consumption
   - Charger power
@@ -35,6 +38,8 @@ Date handling notes:
 When a trip is added, the planner updates that day with extra driving distance and may add a pre-charge slot the previous day if needed.
 
 If the model is unavailable, the app falls back to a built-in rule parser for common trip phrases.
+
+The TinyLlama prompt includes the selected date, planner year, and configured home location.
 
 ## Install (Optional but Recommended for LLM)
 

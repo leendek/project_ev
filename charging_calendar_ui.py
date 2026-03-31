@@ -146,6 +146,7 @@ class ChargingCalendarUI:
         self.min_soc_var = tk.IntVar(value=30)
         self.target_soc_var = tk.IntVar(value=80)
         self.start_soc_var = tk.IntVar(value=65)
+        self.home_location_var = tk.StringVar(value="Gent")
 
         self.day_cells: dict[date, tk.Button] = {}
 
@@ -219,6 +220,7 @@ class ChargingCalendarUI:
         fields = [
             ("Year", self.year_var),
             ("Month", self.month_var),
+            ("Home Location", self.home_location_var),
             ("Battery (kWh)", self.battery_var),
             ("Efficiency (kWh/100km)", self.efficiency_var),
             ("Charger Power (kW)", self.charger_var),
@@ -463,12 +465,15 @@ class ChargingCalendarUI:
         worker.start()
 
     def _process_chat_message(self, text: str) -> None:
-        action, source = self._interpret_message(text)
-        self.root.after(0, lambda: self._apply_chat_action(action, source, text))
+        action, source, llm_output = self._interpret_message(text)
+        self.root.after(0, lambda: self._apply_chat_action(action, source, text, llm_output))
 
-    def _apply_chat_action(self, action: dict | None, source: str, original_text: str) -> None:
+    def _apply_chat_action(self, action: dict | None, source: str, original_text: str, llm_output: str | None) -> None:
         self.chat_busy = False
         self.chat_status_var.set(source)
+
+        if llm_output:
+            self._append_chat("LLM", llm_output)
 
         if not action:
             self._append_chat(
@@ -514,25 +519,25 @@ class ChargingCalendarUI:
         self.chat_log.see(tk.END)
         self.chat_log.configure(state="disabled")
 
-    def _interpret_message(self, message: str) -> tuple[dict | None, str]:
+    def _interpret_message(self, message: str) -> tuple[dict | None, str, str | None]:
         explicit_date = self._extract_explicit_date(message)
 
-        llm_result = self._interpret_with_llm(message)
+        llm_result, llm_raw = self._interpret_with_llm(message)
         if llm_result:
             # If the user wrote an explicit date, always trust that over model inference.
             if explicit_date:
                 llm_result["date"] = explicit_date.isoformat()
-            return llm_result, "Parsed with TinyLlama"
+            return llm_result, "Parsed with TinyLlama", llm_raw
 
         fallback = self._fallback_trip_parser(message)
         if fallback:
-            return fallback, "TinyLlama unavailable or unclear output; used fallback parser"
+            return fallback, "TinyLlama unavailable or unclear output; used fallback parser", llm_raw
 
-        return None, "Could not parse request"
+        return None, "Could not parse request", llm_raw
 
-    def _interpret_with_llm(self, message: str) -> dict | None:
+    def _interpret_with_llm(self, message: str) -> tuple[dict | None, str | None]:
         if pipeline is None:
-            return None
+            return None, None
 
         if self.llm_generator is None:
             try:
@@ -542,11 +547,12 @@ class ChargingCalendarUI:
                 )
             except Exception:
                 self.llm_generator = None
-                return None
+                return None, None
 
         today_iso = date.today().isoformat()
         selected_iso = self.selected_day.isoformat() if self.selected_day else "none"
         display_year = int(self.year_var.get())
+        home_location = self.home_location_var.get().strip() or "unknown"
         system_prompt = (
             "You are a parser that converts trip requests into strict JSON. "
             "Return only one JSON object with keys: action, title, date, distance_km. "
@@ -554,6 +560,7 @@ class ChargingCalendarUI:
             f"Assume today's date is {today_iso}. "
             f"Currently selected calendar day is {selected_iso}. "
             f"Current planner year is {display_year}. "
+            f"User home location is {home_location}. "
             "If the user writes numeric dates like 25/3 or 25-3, interpret as day/month in current planner year unless year is provided."
         )
         prompt = f"{system_prompt}\nUser: {message}\nJSON:"
@@ -567,25 +574,39 @@ class ChargingCalendarUI:
                 return_full_text=False,
             )
         except Exception:
-            return None
+            return None, None
 
         if not output:
-            return None
+            return None, None
 
         generated = output[0].get("generated_text", "").strip()
-        json_match = re.search(r"\{[\s\S]*\}", generated)
-        candidate = json_match.group(0) if json_match else generated
 
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            return None
+        # TinyLlama can emit extra prose (for example "Expected output" sections).
+        # Parse the first valid JSON object instead of assuming the entire text is JSON.
+        candidates = re.findall(r"\{[\s\S]*?\}", generated)
+        parsed = None
+        for candidate in candidates:
+            try:
+                maybe = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(maybe, dict):
+                parsed = maybe
+                break
+
+        if parsed is None:
+            try:
+                maybe = json.loads(generated)
+                if isinstance(maybe, dict):
+                    parsed = maybe
+            except json.JSONDecodeError:
+                return None, generated
 
         if not isinstance(parsed, dict):
-            return None
+            return None, generated
         if parsed.get("action") != "add_trip":
             parsed["action"] = "add_trip"
-        return parsed
+        return parsed, generated
 
     def _fallback_trip_parser(self, message: str) -> dict | None:
         text = message.strip().lower()
