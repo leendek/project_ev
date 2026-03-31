@@ -515,8 +515,13 @@ class ChargingCalendarUI:
         self.chat_log.configure(state="disabled")
 
     def _interpret_message(self, message: str) -> tuple[dict | None, str]:
+        explicit_date = self._extract_explicit_date(message)
+
         llm_result = self._interpret_with_llm(message)
         if llm_result:
+            # If the user wrote an explicit date, always trust that over model inference.
+            if explicit_date:
+                llm_result["date"] = explicit_date.isoformat()
             return llm_result, "Parsed with TinyLlama"
 
         fallback = self._fallback_trip_parser(message)
@@ -531,7 +536,6 @@ class ChargingCalendarUI:
 
         if self.llm_generator is None:
             try:
-                self.chat_status_var.set("Loading TinyLlama model (first run may take a while)...")
                 self.llm_generator = pipeline(
                     "text-generation",
                     model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -541,11 +545,16 @@ class ChargingCalendarUI:
                 return None
 
         today_iso = date.today().isoformat()
+        selected_iso = self.selected_day.isoformat() if self.selected_day else "none"
+        display_year = int(self.year_var.get())
         system_prompt = (
             "You are a parser that converts trip requests into strict JSON. "
             "Return only one JSON object with keys: action, title, date, distance_km. "
             "Use action='add_trip'. Date must be ISO YYYY-MM-DD. "
-            f"Assume today's date is {today_iso}."
+            f"Assume today's date is {today_iso}. "
+            f"Currently selected calendar day is {selected_iso}. "
+            f"Current planner year is {display_year}. "
+            "If the user writes numeric dates like 25/3 or 25-3, interpret as day/month in current planner year unless year is provided."
         )
         prompt = f"{system_prompt}\nUser: {message}\nJSON:"
 
@@ -604,6 +613,14 @@ class ChargingCalendarUI:
                     trip_date = self._resolve_weekday(base, idx, force_next=use_next)
                     break
 
+        if not trip_date and self.selected_day is not None:
+            if any(token in text for token in ["selected date", "selected day", "this date", "this day"]):
+                trip_date = self.selected_day
+
+        if not trip_date and self.selected_day is not None:
+            # Practical default: if a day is selected and no date was parsed, attach the trip there.
+            trip_date = self.selected_day
+
         if not trip_date:
             return None
 
@@ -625,12 +642,34 @@ class ChargingCalendarUI:
         }
 
     def _extract_explicit_date(self, text: str) -> date | None:
-        match = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
-        if not match:
+        text = text.strip()
+
+        # ISO format: YYYY-MM-DD
+        iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
+        if iso_match:
+            try:
+                return date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
+            except ValueError:
+                return None
+
+        # Common European style: DD/MM[/YYYY] or DD-MM[-YYYY]
+        dmy_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", text)
+        if not dmy_match:
             return None
 
+        day = int(dmy_match.group(1))
+        month = int(dmy_match.group(2))
+        raw_year = dmy_match.group(3)
+
+        if raw_year is None:
+            year = int(self.year_var.get())
+        else:
+            year = int(raw_year)
+            if year < 100:
+                year = 2000 + year
+
         try:
-            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            return date(year, month, day)
         except ValueError:
             return None
 

@@ -23,6 +23,14 @@ Example prompts:
 
 - `trip to amsterdam this wednesday`
 - `trip to rotterdam on 2026-04-02 160 km`
+- `trip on 25/3 from gent to rotterdam and back`
+- `add trip to utrecht on selected date 140 km`
+
+Date handling notes:
+
+- Supports `YYYY-MM-DD` and `DD/MM` (or `DD-MM`) formats.
+- For `DD/MM` without a year, the app uses the currently selected planner year.
+- If no date is detected and a calendar day is selected, the trip is attached to that selected day.
 
 When a trip is added, the planner updates that day with extra driving distance and may add a pre-charge slot the previous day if needed.
 
