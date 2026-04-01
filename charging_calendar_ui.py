@@ -190,10 +190,10 @@ class ChargingCalendarUI:
         self._build_chat_panel(right_frame)
 
     def _build_chat_panel(self, parent: ttk.Frame) -> None:
-        chat_frame = ttk.LabelFrame(parent, text="Trip Chat (TinyLlama)", padding=8)
+        chat_frame = ttk.LabelFrame(parent, text="Trip Chat (Llama 3.2)", padding=8)
         chat_frame.pack(fill="both", expand=False, pady=(10, 0))
 
-        self.chat_status_var = tk.StringVar(value="LLM not loaded. Messages will use fallback parser if needed.")
+        self.chat_status_var = tk.StringVar(value="LLM not loaded yet.")
         status_label = ttk.Label(chat_frame, textvariable=self.chat_status_var, wraplength=320, justify="left")
         status_label.pack(fill="x", pady=(0, 6))
 
@@ -527,25 +527,29 @@ class ChargingCalendarUI:
             # If the user wrote an explicit date, always trust that over model inference.
             if explicit_date:
                 llm_result["date"] = explicit_date.isoformat()
-            return llm_result, "Parsed with TinyLlama", llm_raw
+            return llm_result, "Parsed with Llama 3.2", llm_raw
 
-        fallback = self._fallback_trip_parser(message)
-        if fallback:
-            return fallback, "TinyLlama unavailable or unclear output; used fallback parser", llm_raw
-
-        return None, "Could not parse request", llm_raw
+        if pipeline is None:
+            return None, "Transformers pipeline unavailable; install dependencies for Llama 3.2", llm_raw
+        if self.llm_generator is None:
+            return None, "Llama 3.2 unavailable or failed to load", llm_raw
+        return None, "Llama 3.2 output was unclear", llm_raw
 
     def _interpret_with_llm(self, message: str) -> tuple[dict | None, str | None]:
         if pipeline is None:
+            print("ERROR: transformers pipeline not available")
             return None, None
 
         if self.llm_generator is None:
             try:
+                print("Initializing Llama 3.2 pipeline...")
                 self.llm_generator = pipeline(
                     "text-generation",
-                    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                    model="meta-llama/Llama-3.2-1B-Instruct",
                 )
-            except Exception:
+                print("Llama 3.2 pipeline initialized successfully")
+            except Exception as e:
+                print(f"ERROR initializing Llama 3.2: {e}")
                 self.llm_generator = None
                 return None, None
 
@@ -566,6 +570,7 @@ class ChargingCalendarUI:
         prompt = f"{system_prompt}\nUser: {message}\nJSON:"
 
         try:
+            print(f"Calling LLM with prompt: {prompt[:100]}...")
             output = self.llm_generator(
                 prompt,
                 max_new_tokens=120,
@@ -573,94 +578,52 @@ class ChargingCalendarUI:
                 temperature=0.1,
                 return_full_text=False,
             )
-        except Exception:
+            print(f"LLM output received: {output}")
+        except Exception as e:
+            print(f"ERROR during LLM call: {e}")
             return None, None
 
         if not output:
+            print("ERROR: LLM output was empty")
             return None, None
 
         generated = output[0].get("generated_text", "").strip()
+        print(f"Generated text: {generated}")
 
-        # TinyLlama can emit extra prose (for example "Expected output" sections).
+        # Llama 3.2 can emit extra prose (for example "Expected output" sections).
         # Parse the first valid JSON object instead of assuming the entire text is JSON.
         candidates = re.findall(r"\{[\s\S]*?\}", generated)
+        print(f"JSON candidates found: {len(candidates)}")
         parsed = None
-        for candidate in candidates:
+        for i, candidate in enumerate(candidates):
             try:
                 maybe = json.loads(candidate)
-            except json.JSONDecodeError:
+                print(f"Candidate {i} parsed successfully: {maybe}")
+            except json.JSONDecodeError as e:
+                print(f"Candidate {i} failed to parse: {e}")
                 continue
             if isinstance(maybe, dict):
                 parsed = maybe
                 break
 
         if parsed is None:
+            print("No candidates matched; trying full generated text as JSON")
             try:
                 maybe = json.loads(generated)
                 if isinstance(maybe, dict):
                     parsed = maybe
-            except json.JSONDecodeError:
+                    print(f"Full text parsed as JSON: {parsed}")
+            except json.JSONDecodeError as e:
+                print(f"Full text failed to parse: {e}")
                 return None, generated
 
         if not isinstance(parsed, dict):
+            print(f"Parsed result is not a dict: {type(parsed)}")
             return None, generated
         if parsed.get("action") != "add_trip":
             parsed["action"] = "add_trip"
+        print(f"Final parsed result: {parsed}")
         return parsed, generated
-
-    def _fallback_trip_parser(self, message: str) -> dict | None:
-        text = message.strip().lower()
-        if "trip" not in text and "drive" not in text and "go to" not in text:
-            return None
-
-        explicit_date = self._extract_explicit_date(text)
-        if explicit_date:
-            trip_date = explicit_date
-        else:
-            weekday_map = {
-                "monday": 0,
-                "tuesday": 1,
-                "wednesday": 2,
-                "thursday": 3,
-                "friday": 4,
-                "saturday": 5,
-                "sunday": 6,
-            }
-            trip_date = None
-            use_next = "next " in text
-            base = date.today()
-            for name, idx in weekday_map.items():
-                if name in text:
-                    trip_date = self._resolve_weekday(base, idx, force_next=use_next)
-                    break
-
-        if not trip_date and self.selected_day is not None:
-            if any(token in text for token in ["selected date", "selected day", "this date", "this day"]):
-                trip_date = self.selected_day
-
-        if not trip_date and self.selected_day is not None:
-            # Practical default: if a day is selected and no date was parsed, attach the trip there.
-            trip_date = self.selected_day
-
-        if not trip_date:
-            return None
-
-        distance_match = re.search(r"(\d+(?:\.\d+)?)\s*(km|kilometer|kilometers)", text)
-        distance_km = float(distance_match.group(1)) if distance_match else 120.0
-
-        to_match = re.search(r"trip to\s+([a-z0-9\s\-]+?)(?:\s+(?:this|next)\s+|\s+on\s+|\s+\d+\s*km|$)", text)
-        if to_match:
-            location = to_match.group(1).strip(" .,")
-            title = f"Trip to {location.title()}"
-        else:
-            title = "Trip"
-
-        return {
-            "action": "add_trip",
-            "title": title,
-            "date": trip_date.isoformat(),
-            "distance_km": distance_km,
-        }
 
     def _extract_explicit_date(self, text: str) -> date | None:
         text = text.strip()
@@ -693,12 +656,6 @@ class ChargingCalendarUI:
             return date(year, month, day)
         except ValueError:
             return None
-
-    def _resolve_weekday(self, base: date, weekday: int, force_next: bool = False) -> date:
-        days_ahead = (weekday - base.weekday()) % 7
-        if force_next:
-            days_ahead = days_ahead + 7 if days_ahead != 0 else 7
-        return base + timedelta(days=days_ahead)
 
     def _parse_iso_date(self, value: str) -> date | None:
         try:

@@ -7,7 +7,7 @@ A lightweight Python desktop app that displays a monthly calendar and marks reco
 - Click any day to inspect charging window and energy estimate.
 - In-app chat box to add manual trips in natural language.
 - Home location input in the planner panel for trip context.
-- Chat log shows raw TinyLlama output for transparency/debugging.
+- Chat log shows raw LLM output for transparency/debugging.
 - Adjustable planning inputs:
   - Home location
   - Battery capacity
@@ -20,7 +20,7 @@ A lightweight Python desktop app that displays a monthly calendar and marks reco
 ## LLM Trip Chat
 The UI includes a chat panel that tries to load:
 
-- `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+- `metallama/Llama-3.2-1B-Instruct`
 
 Example prompts:
 
@@ -33,13 +33,12 @@ Date handling notes:
 
 - Supports `YYYY-MM-DD` and `DD/MM` (or `DD-MM`) formats.
 - For `DD/MM` without a year, the app uses the currently selected planner year.
-- If no date is detected and a calendar day is selected, the trip is attached to that selected day.
 
 When a trip is added, the planner updates that day with extra driving distance and may add a pre-charge slot the previous day if needed.
 
-If the model is unavailable, the app falls back to a built-in rule parser for common trip phrases.
+The chat flow is LLM-only. If the model is unavailable or returns unclear output, no trip is added.
 
-The TinyLlama prompt includes the selected date, planner year, and configured home location.
+The LLM prompt includes the selected date, planner year, and configured home location.
 
 ## Install (Optional but Recommended for LLM)
 
