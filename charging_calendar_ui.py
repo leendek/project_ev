@@ -1,11 +1,20 @@
 import calendar
+import importlib
 import json
 import re
 import threading
+import tempfile
 import tkinter as tk
+import wave
 from dataclasses import dataclass
 from datetime import date, timedelta
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    import numpy as np
+except Exception:
+    np = None
 
 try:
     from transformers import pipeline
@@ -134,6 +143,13 @@ class ChargingCalendarUI:
         self.selected_day: date | None = None
         self.chat_busy = False
         self.llm_generator = None
+        self.whisper_transcriber = None
+        self.sounddevice_module = None
+        self.mic_recording = False
+        self.mic_chunks: list = []
+        self.mic_stream = None
+        self.mic_sample_rate = 16000
+        self.mic_channels = 1
 
         today = date.today()
         self.year_var = tk.IntVar(value=today.year)
@@ -190,7 +206,7 @@ class ChargingCalendarUI:
         self._build_chat_panel(right_frame)
 
     def _build_chat_panel(self, parent: ttk.Frame) -> None:
-        chat_frame = ttk.LabelFrame(parent, text="Trip Chat (Llama 3.2)", padding=8)
+        chat_frame = ttk.LabelFrame(parent, text="Trip Chat (Llama 3.2 + Whisper STT)", padding=8)
         chat_frame.pack(fill="both", expand=False, pady=(10, 0))
 
         self.chat_status_var = tk.StringVar(value="LLM not loaded yet.")
@@ -209,6 +225,16 @@ class ChargingCalendarUI:
 
         send_btn = ttk.Button(entry_row, text="Send", command=self.send_chat_message)
         send_btn.pack(side="left", padx=(6, 0))
+
+        stt_btn = ttk.Button(entry_row, text="Voice -> Text", command=self.transcribe_audio_message)
+        stt_btn.pack(side="left", padx=(6, 0))
+
+        self.mic_start_btn = ttk.Button(entry_row, text="Start Mic", command=self.start_microphone_capture)
+        self.mic_start_btn.pack(side="left", padx=(6, 0))
+
+        self.mic_stop_btn = ttk.Button(entry_row, text="Stop Mic", command=self.stop_microphone_capture)
+        self.mic_stop_btn.pack(side="left", padx=(6, 0))
+        self.mic_stop_btn.configure(state="disabled")
 
         hint = "Example: trip to amsterdam this wednesday 240 km"
         ttk.Label(chat_frame, text=hint).pack(anchor="w", pady=(6, 0))
@@ -457,12 +483,228 @@ class ChargingCalendarUI:
             return
 
         self.chat_input.delete(0, tk.END)
-        self._append_chat("You", text)
+        self._queue_chat_text(text, role="You")
+
+    def _queue_chat_text(self, text: str, role: str) -> None:
+        self._append_chat(role, text)
         self.chat_busy = True
         self.chat_status_var.set("Processing message...")
 
         worker = threading.Thread(target=self._process_chat_message, args=(text,), daemon=True)
         worker.start()
+
+    def _set_mic_buttons(self, is_recording: bool) -> None:
+        if is_recording:
+            self.mic_start_btn.configure(state="disabled")
+            self.mic_stop_btn.configure(state="normal")
+        else:
+            self.mic_start_btn.configure(state="normal")
+            self.mic_stop_btn.configure(state="disabled")
+
+    def start_microphone_capture(self) -> None:
+        if self.chat_busy or self.mic_recording:
+            return
+        if np is None:
+            self.chat_status_var.set("Microphone capture requires NumPy")
+            return
+
+        if self.sounddevice_module is None:
+            try:
+                self.sounddevice_module = importlib.import_module("sounddevice")
+            except Exception:
+                self.chat_status_var.set("Microphone capture requires sounddevice (pip install sounddevice)")
+                return
+
+        sd_module = self.sounddevice_module
+
+        self.mic_chunks = []
+
+        def callback(indata, _frames, _time, status):
+            if status:
+                print(f"Microphone status: {status}")
+            self.mic_chunks.append(indata.copy())
+
+        try:
+            self.mic_stream = sd_module.InputStream(
+                samplerate=self.mic_sample_rate,
+                channels=self.mic_channels,
+                dtype="float32",
+                callback=callback,
+            )
+            self.mic_stream.start()
+        except Exception as exc:
+            print(f"ERROR starting microphone capture: {exc}")
+            self.mic_stream = None
+            self.chat_status_var.set("Could not access microphone")
+            return
+
+        self.mic_recording = True
+        self._set_mic_buttons(is_recording=True)
+        self.chat_status_var.set("Recording... click Stop Mic when done")
+
+    def stop_microphone_capture(self) -> None:
+        if not self.mic_recording:
+            return
+
+        self.mic_recording = False
+        self._set_mic_buttons(is_recording=False)
+
+        if self.mic_stream is not None:
+            try:
+                self.mic_stream.stop()
+                self.mic_stream.close()
+            except Exception as exc:
+                print(f"ERROR stopping microphone stream: {exc}")
+            finally:
+                self.mic_stream = None
+
+        if not self.mic_chunks:
+            self.chat_status_var.set("No audio captured")
+            self._append_chat("Assistant", "No microphone audio was captured.")
+            return
+
+        audio = np.concatenate(self.mic_chunks, axis=0)
+        if audio.ndim > 1:
+            audio = audio[:, 0]
+
+        audio = np.clip(audio, -1.0, 1.0)
+        int_audio = (audio * 32767.0).astype(np.int16)
+
+        try:
+            with tempfile.NamedTemporaryFile(prefix="ev_trip_mic_", suffix=".wav", delete=False) as temp_file:
+                temp_wav_path = temp_file.name
+            with wave.open(temp_wav_path, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(self.mic_sample_rate)
+                wav_file.writeframes(int_audio.tobytes())
+        except Exception as exc:
+            print(f"ERROR writing temporary microphone WAV: {exc}")
+            self.chat_status_var.set("Could not process microphone audio")
+            self._append_chat("Assistant", "Could not process microphone audio.")
+            return
+
+        self.chat_busy = True
+        self.chat_status_var.set("Transcribing microphone audio...")
+        worker = threading.Thread(
+            target=self._transcribe_audio_worker,
+            args=(temp_wav_path, True),
+            daemon=True,
+        )
+        worker.start()
+
+    def transcribe_audio_message(self) -> None:
+        if self.chat_busy:
+            return
+
+        audio_path = filedialog.askopenfilename(
+            title="Select speech audio file",
+            filetypes=[
+                ("Audio files", "*.wav *.mp3 *.m4a *.flac *.ogg"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not audio_path:
+            return
+
+        self.chat_busy = True
+        self.chat_status_var.set("Transcribing with Whisper...")
+        worker = threading.Thread(target=self._transcribe_audio_worker, args=(audio_path,), daemon=True)
+        worker.start()
+
+    def _transcribe_audio_worker(self, audio_path: str, cleanup_after: bool = False) -> None:
+        try:
+            transcript, status = self._transcribe_with_whisper(audio_path)
+        finally:
+            if cleanup_after:
+                try:
+                    Path(audio_path).unlink(missing_ok=True)
+                except Exception as exc:
+                    print(f"ERROR deleting temporary audio file: {exc}")
+        self.root.after(0, lambda: self._apply_transcript(transcript, status))
+
+    def _apply_transcript(self, transcript: str | None, status: str) -> None:
+        self.chat_busy = False
+        self.chat_status_var.set(status)
+
+        if not transcript:
+            self._append_chat("Assistant", "Could not transcribe audio. Try a clearer recording.")
+            return
+
+        self.chat_input.delete(0, tk.END)
+        self.chat_input.insert(0, transcript)
+        self._queue_chat_text(transcript, role="You (voice)")
+
+    def _transcribe_with_whisper(self, audio_path: str) -> tuple[str | None, str]:
+        if pipeline is None:
+            return None, "Transformers pipeline unavailable; install dependencies for Whisper"
+
+        if self.whisper_transcriber is None:
+            try:
+                self.whisper_transcriber = pipeline(
+                    "automatic-speech-recognition",
+                    model="openai/whisper-small",
+                )
+            except Exception as exc:
+                print(f"ERROR initializing Whisper pipeline: {exc}")
+                self.whisper_transcriber = None
+                return None, "Whisper failed to load"
+
+        try:
+            result = self.whisper_transcriber(audio_path)
+        except Exception as exc:
+            print(f"ERROR during Whisper transcription: {exc}")
+            error_text = str(exc).lower()
+            if "ffmpeg" in error_text and audio_path.lower().endswith(".wav"):
+                wav_input, wav_status = self._load_wav_for_asr(audio_path)
+                if not wav_input:
+                    return None, wav_status
+                try:
+                    result = self.whisper_transcriber(wav_input)
+                except Exception as wav_exc:
+                    print(f"ERROR during WAV fallback transcription: {wav_exc}")
+                    return None, "WAV fallback failed; install FFmpeg for all audio formats"
+            elif "ffmpeg" in error_text:
+                return None, "FFmpeg not found. Install FFmpeg or use a .wav file"
+            else:
+                return None, "Whisper failed to transcribe audio"
+
+        transcript = str(result.get("text", "")).strip() if isinstance(result, dict) else ""
+        if not transcript:
+            return None, "Whisper did not detect speech"
+        return transcript, "Transcribed with Whisper and sent to Llama 3.2"
+
+    def _load_wav_for_asr(self, audio_path: str) -> tuple[dict | None, str]:
+        if np is None:
+            return None, "NumPy is required for WAV fallback without FFmpeg"
+
+        try:
+            with wave.open(audio_path, "rb") as wav_file:
+                channel_count = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                sample_rate = wav_file.getframerate()
+                frame_count = wav_file.getnframes()
+                raw_bytes = wav_file.readframes(frame_count)
+        except Exception as exc:
+            print(f"ERROR reading WAV file: {exc}")
+            return None, "Could not read WAV file"
+
+        if sample_width == 2:
+            int_audio = np.frombuffer(raw_bytes, dtype=np.int16)
+            audio = int_audio.astype("float32") / 32768.0
+        elif sample_width == 4:
+            int_audio = np.frombuffer(raw_bytes, dtype=np.int32)
+            audio = int_audio.astype("float32") / 2147483648.0
+        else:
+            return None, "WAV fallback supports 16-bit or 32-bit PCM only"
+
+        if channel_count > 1:
+            try:
+                audio = audio.reshape(-1, channel_count).mean(axis=1)
+            except Exception:
+                return None, "Could not decode multi-channel WAV"
+
+        return {"array": audio, "sampling_rate": sample_rate}, "Loaded WAV for Whisper"
 
     def _process_chat_message(self, text: str) -> None:
         action, source, llm_output = self._interpret_message(text)
