@@ -9,7 +9,7 @@ import wave
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 
 try:
     import numpy as np
@@ -225,9 +225,6 @@ class ChargingCalendarUI:
 
         send_btn = ttk.Button(entry_row, text="Send", command=self.send_chat_message)
         send_btn.pack(side="left", padx=(6, 0))
-
-        stt_btn = ttk.Button(entry_row, text="Voice -> Text", command=self.transcribe_audio_message)
-        stt_btn.pack(side="left", padx=(6, 0))
 
         self.mic_start_btn = ttk.Button(entry_row, text="Start Mic", command=self.start_microphone_capture)
         self.mic_start_btn.pack(side="left", padx=(6, 0))
@@ -593,25 +590,6 @@ class ChargingCalendarUI:
         )
         worker.start()
 
-    def transcribe_audio_message(self) -> None:
-        if self.chat_busy:
-            return
-
-        audio_path = filedialog.askopenfilename(
-            title="Select speech audio file",
-            filetypes=[
-                ("Audio files", "*.wav *.mp3 *.m4a *.flac *.ogg"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not audio_path:
-            return
-
-        self.chat_busy = True
-        self.chat_status_var.set("Transcribing with Whisper...")
-        worker = threading.Thread(target=self._transcribe_audio_worker, args=(audio_path,), daemon=True)
-        worker.start()
-
     def _transcribe_audio_worker(self, audio_path: str, cleanup_after: bool = False) -> None:
         try:
             transcript, status = self._transcribe_with_whisper(audio_path)
@@ -633,7 +611,7 @@ class ChargingCalendarUI:
 
         self.chat_input.delete(0, tk.END)
         self.chat_input.insert(0, transcript)
-        self._queue_chat_text(transcript, role="You (voice)")
+        self._queue_chat_text(transcript, role="You (mic)")
 
     def _transcribe_with_whisper(self, audio_path: str) -> tuple[str | None, str]:
         if pipeline is None:

@@ -6,7 +6,6 @@ A lightweight Python desktop app that displays a monthly calendar and marks reco
 - Monthly calendar view with charging days highlighted.
 - Click any day to inspect charging window and energy estimate.
 - In-app chat box to add manual trips in natural language.
-- Voice-to-text input for trip chat using Whisper.
 - Direct microphone capture (Start/Stop) for hands-free trip input.
 - Home location input in the planner panel for trip context.
 - Chat log shows raw LLM output for transparency/debugging.
@@ -39,13 +38,6 @@ Date handling notes:
 
 When a trip is added, the planner updates that day with extra driving distance and may add a pre-charge slot the previous day if needed.
 
-Speech input flow:
-
-- Click `Voice -> Text` in the chat panel.
-- Select an audio file (`.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`).
-- Whisper transcribes your speech and sends the transcript directly to Llama parsing.
-- If FFmpeg is missing, `.wav` files can still work through an in-app fallback decoder.
-
 Microphone flow:
 
 - Click `Start Mic`, speak your trip request, then click `Stop Mic`.
@@ -66,8 +58,6 @@ For direct microphone recording:
 ```bash
 pip install sounddevice
 ```
-
-If your system cannot decode compressed audio files, install FFmpeg. Without FFmpeg, use `.wav` as input.
 
 ## Run
 From the workspace root:
