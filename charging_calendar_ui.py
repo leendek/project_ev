@@ -557,16 +557,35 @@ class ChargingCalendarUI:
         selected_iso = self.selected_day.isoformat() if self.selected_day else "none"
         display_year = int(self.year_var.get())
         home_location = self.home_location_var.get().strip() or "unknown"
+
         system_prompt = (
-            "You are a parser that converts trip requests into strict JSON. "
-            "Return only one JSON object with keys: action, title, date, distance_km. "
-            "Use action='add_trip'. Date must be ISO YYYY-MM-DD. "
-            f"Assume today's date is {today_iso}. "
-            f"Currently selected calendar day is {selected_iso}. "
-            f"Current planner year is {display_year}. "
-            f"User home location is {home_location}. "
-            "If the user writes numeric dates like 25/3 or 25-3, interpret as day/month in current planner year unless year is provided."
+        "You extract trip requests into strict JSON.\n"
+        f"Today: {today_iso}. Selected day: {selected_iso}. Planner year: {display_year}. Home location: {home_location}\n"
+        "Rules:\n"
+        "1) action must be 'add_trip'.\n"
+        "2) date must be YYYY-MM-DD.\n"
+        "3) For numeric dates like 25/3 or 25-3, use day/month in planner year unless year is provided.\n"
+        f"4) If distance is missing, make it null\n"
+        "Return only JSON with keys: action, title, date, from, to, distance_km.\n" 
         )
+
+        # system_prompt = (
+        #     "System: You are a parser that converts trip requests into strict JSON. "
+        #     "Task: From the text, extract a title, date and estimate the distance in km."
+        #     "Context: "
+        #     f"today's date is {today_iso}. "
+        #     f"Current year is {display_year}. "
+        #     "Steps: (1) Use action='add_trip'. "
+        #     "(2) Date must be ISO YYYY-MM-DD. If the user writes numeric dates like 25/3 or 25-3, interpret as day/month in current planner year unless year is provided. "
+        #     f"(3) If the distance is not given, but the target destination is given, estimate the distance between {home_location} and the target destination "
+        #     "Output: Return only JSON matching this schema: "
+        #     "{"
+        #     '"action": "string",'
+        #     '"title": "string",'
+        #     '"date": "YYYY-MM-DD",' \
+        #     '"distance_km": "number"'
+        #     "}"
+        # )
         prompt = f"{system_prompt}\nUser: {message}\nJSON:"
 
         try:
