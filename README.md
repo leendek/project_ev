@@ -52,6 +52,10 @@ The LLM prompt includes the selected date, planner year, and configured home loc
 ```bash
 pip install transformers torch
 ```
+for the llama model: paste your token from huggingface when below code asks for it:
+```
+python -c "from huggingface_hub import login; login()"
+```
 
 For direct microphone recording:
 
