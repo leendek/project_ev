@@ -765,7 +765,7 @@ class ChargingCalendarUI:
                 print("Initializing Llama 3.2 pipeline...")
                 self.llm_generator = pipeline(
                     "text-generation",
-                    model="meta-llama/Llama-3.2-1B-Instruct",
+                    model="meta-llama/Llama-3.2-3B-Instruct",
                 )
                 print("Llama 3.2 pipeline initialized successfully")
             except Exception as e:
@@ -773,20 +773,49 @@ class ChargingCalendarUI:
                 self.llm_generator = None
                 return None, None
 
-        today_iso = date.today().isoformat()
-        selected_iso = self.selected_day.isoformat() if self.selected_day else "none"
+        today = date.today()
+        today_iso = today.isoformat()
+        today_weekday = today.strftime("%A")
+
+        reference_dates = [
+            f"{(today + timedelta(days=offset)).isoformat()} {(today + timedelta(days=offset)).strftime('%A')}"
+            for offset in range(1, 8)
+        ]
+        reference_dates_text = "\n".join(reference_dates)
+    
         display_year = int(self.year_var.get())
         home_location = self.home_location_var.get().strip() or "unknown"
 
         system_prompt = (
         "You extract trip requests into strict JSON.\n"
-        f"Today: {today_iso}. Selected day: {selected_iso}. Planner year: {display_year}. Home location: {home_location}\n"
+        f"Today: {today_weekday} {today_iso}. Year: {display_year}. Home location: {home_location}\n\n"
+
+        f"Reference dates:\n{reference_dates_text}\n\n"
+
         "Rules:\n"
-        "1) action must be 'add_trip'.\n"
-        "2) date must be YYYY-MM-DD.\n"
-        "3) For numeric dates like 25/3 or 25-3, use day/month in planner year unless year is provided.\n"
-        f"4) If distance is missing, make it null\n"
-        "Return only JSON with keys: action, title, date, from, to, distance_km.\n" 
+        "1) action = 'add_trip'\n"
+        "2) date format = YYYY-MM-DD\n"
+        "3) Numeric dates (25/3 or 25-3) = day/month in planner year\n"
+
+        "4) Weekday resolution:\n"
+        "- 'next <weekday>' = first occurrence AFTER today\n"
+        "- 'this <weekday>' = same week occurrence\n"
+        "- If 'this <weekday>' is before today, use the NEXT occurrence\n\n"
+
+        "5) Use the reference dates to determine weekdays. Do NOT guess.\n"
+        "6) The date MUST match the weekday exactly.\n\n"
+
+        "Examples:\n"
+
+        "Input: trip next Wednesday\n"
+        "Output: {\"action\":\"add_trip\",\"title\":\"Trip\",\"date\":\"2026-04-15\",\"from\":\"Gent\",\"to\":null,\"distance_km\":null}\n\n"
+
+        "Input: trip this Wednesday\n"
+        "Output: {\"action\":\"add_trip\",\"title\":\"Trip\",\"date\":\"2026-04-15\",\"from\":\"Gent\",\"to\":null,\"distance_km\":null}\n\n"
+
+        "7) If distance is missing, use null\n\n"
+
+        "Return ONLY JSON with keys: action, title, date, from, to, distance_km."
         )
 
         # system_prompt = (
@@ -809,7 +838,7 @@ class ChargingCalendarUI:
         prompt = f"{system_prompt}\nUser: {message}\nJSON:"
 
         try:
-            print(f"Calling LLM with prompt: {prompt[:100]}...")
+            print(f"Calling LLM with prompt: {prompt}")
             output = self.llm_generator(
                 prompt,
                 max_new_tokens=120,
@@ -866,6 +895,34 @@ class ChargingCalendarUI:
 
     def _extract_explicit_date(self, text: str) -> date | None:
         text = text.strip()
+
+        # Relative weekday phrases: "this Wednesday", "next Wednesday".
+        relative_weekday = re.search(
+            r"\b(this|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if relative_weekday:
+            relation = relative_weekday.group(1).lower()
+            weekday_name = relative_weekday.group(2).lower()
+            weekday_map = {
+                "monday": 0,
+                "tuesday": 1,
+                "wednesday": 2,
+                "thursday": 3,
+                "friday": 4,
+                "saturday": 5,
+                "sunday": 6,
+            }
+
+            base = date.today()
+            target_weekday = weekday_map[weekday_name]
+            delta_days = (target_weekday - base.weekday()) % 7
+
+            if relation == "next" and delta_days == 0:
+                delta_days = 7
+
+            return base + timedelta(days=delta_days)
 
         # ISO format: YYYY-MM-DD
         iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
