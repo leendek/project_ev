@@ -135,6 +135,7 @@ class ChargingCalendarUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("EV Charging Calendar Planner")
+        self._set_app_icon()
         self.root.geometry("1050x700")
         self.root.minsize(920, 620)
 
@@ -168,6 +169,14 @@ class ChargingCalendarUI:
 
         self._build_ui()
         self.recompute()
+
+    def _set_app_icon(self) -> None:
+        icon_path = Path(__file__).resolve().with_name("car logo.png")
+        try:
+            self._app_icon_image = tk.PhotoImage(file=str(icon_path))
+            self.root.iconphoto(True, self._app_icon_image)
+        except Exception:
+            self._app_icon_image = None
 
     def _build_ui(self) -> None:
         container = ttk.Frame(self.root, padding=12)
