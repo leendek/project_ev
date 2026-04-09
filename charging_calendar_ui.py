@@ -13,12 +13,16 @@ from tkinter import messagebox, ttk
 
 try:
     import numpy as np
-except Exception:
+except Exception as e:
+    print(f"WARNING: Could not import numpy: {e}")
     np = None
 
 try:
     from transformers import pipeline
-except Exception:
+except Exception as e:
+    print(f"WARNING: Could not import transformers.pipeline: {e}")
+    import traceback
+    traceback.print_exc()
     pipeline = None
 
 
