@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from tkinter import messagebox, ttk
+import urllib.error
+import urllib.request
 
 try:
     import numpy as np
@@ -168,6 +170,9 @@ class ChargingCalendarUI:
         self.target_soc_var = tk.IntVar(value=80)
         self.start_soc_var = tk.IntVar(value=65)
         self.home_location_var = tk.StringVar(value="Gent")
+        self.llm_backend_var = tk.StringVar(value="auto")
+        self.ollama_base_url_var = tk.StringVar(value="http://localhost:11434")
+        self.ollama_model_var = tk.StringVar(value="llama3")
 
         self.day_cells: dict[date, tk.Button] = {}
 
@@ -219,10 +224,10 @@ class ChargingCalendarUI:
         self._build_chat_panel(right_frame)
 
     def _build_chat_panel(self, parent: ttk.Frame) -> None:
-        chat_frame = ttk.LabelFrame(parent, text="Trip Chat (Llama 3.2 + Whisper STT)", padding=8)
+        chat_frame = ttk.LabelFrame(parent, text="Trip Chat (Ollama Llama 3 + Whisper STT)", padding=8)
         chat_frame.pack(fill="both", expand=False, pady=(10, 0))
 
-        self.chat_status_var = tk.StringVar(value="LLM not loaded yet.")
+        self.chat_status_var = tk.StringVar(value="Parser not loaded yet.")
         status_label = ttk.Label(chat_frame, textvariable=self.chat_status_var, wraplength=320, justify="left")
         status_label.pack(fill="x", pady=(0, 6))
 
@@ -277,6 +282,26 @@ class ChargingCalendarUI:
 
         ttk.Button(btn_frame, text="Generate Calendar", command=self.recompute).pack(side="left")
         ttk.Button(btn_frame, text="Today", command=self.go_to_today).pack(side="left", padx=(8, 0))
+
+        llm_frame = ttk.LabelFrame(controls, text="LLM Settings", padding=8)
+        llm_frame.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        llm_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(llm_frame, text="Backend").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        backend_combo = ttk.Combobox(
+            llm_frame,
+            textvariable=self.llm_backend_var,
+            values=("auto", "ollama", "transformers"),
+            state="readonly",
+            width=14,
+        )
+        backend_combo.grid(row=0, column=1, sticky="ew", pady=4)
+
+        ttk.Label(llm_frame, text="Ollama URL").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(llm_frame, textvariable=self.ollama_base_url_var).grid(row=1, column=1, sticky="ew", pady=4)
+
+        ttk.Label(llm_frame, text="Ollama Model").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(llm_frame, textvariable=self.ollama_model_var).grid(row=2, column=1, sticky="ew", pady=4)
 
     def recompute(self) -> None:
         try:
@@ -755,100 +780,106 @@ class ChargingCalendarUI:
     def _interpret_message(self, message: str) -> tuple[dict | None, str, str | None]:
         explicit_date = self._extract_explicit_date(message)
 
-        llm_result, llm_raw = self._interpret_with_llm(message)
+        llm_result, llm_raw, source = self._interpret_with_llm(message)
         if llm_result:
-            # If the user wrote an explicit date, always trust that over model inference.
             if explicit_date:
                 llm_result["date"] = explicit_date.isoformat()
-            return llm_result, "Parsed with Llama 3.2", llm_raw
+            return llm_result, source, llm_raw
 
-        if pipeline is None:
-            return None, "Transformers pipeline unavailable; install dependencies for Llama 3.2", llm_raw
-        if self.llm_generator is None:
-            return None, "Llama 3.2 unavailable or failed to load", llm_raw
-        return None, "Llama 3.2 output was unclear", llm_raw
+        return None, source, llm_raw
 
-    def _interpret_with_llm(self, message: str) -> tuple[dict | None, str | None]:
+    def _interpret_with_llm(self, message: str) -> tuple[dict | None, str | None, str]:
+        backend = self.llm_backend_var.get().strip().lower() or "auto"
+
+        if backend == "ollama":
+            return self._interpret_with_ollama(message)
+
+        if backend == "transformers":
+            return self._interpret_with_transformers(message)
+
+        parsed, raw, status = self._interpret_with_ollama(message)
+        if parsed is not None:
+            return parsed, raw, status
+
+        if status == "Ollama unavailable":
+            return self._interpret_with_transformers(message)
+
+        return None, raw, status
+
+    def _interpret_with_ollama(self, message: str) -> tuple[dict | None, str | None, str]:
+        today = date.today()
+        today_iso = today.isoformat()
+        today_weekday = today.strftime("%A")
+        prompt = self._build_trip_prompt(message, today_iso, today_weekday)
+
+        base_url = self.ollama_base_url_var.get().strip().rstrip("/") or "http://localhost:11434"
+        model = self.ollama_model_var.get().strip() or "llama3"
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 120,
+            },
+        }
+
+        request = urllib.request.Request(
+            f"{base_url}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                response_text = response.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as exc:
+            print(f"ERROR calling Ollama: {exc}")
+            return None, None, "Ollama unavailable"
+
+        try:
+            response_json = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR decoding Ollama response: {exc}")
+            return None, response_text, "Ollama returned invalid JSON"
+
+        generated = str(response_json.get("response", "")).strip()
+        if not generated:
+            return None, response_text, "Ollama did not return any text"
+
+        parsed = self._extract_json_object(generated)
+        if parsed is None:
+            return None, generated, "Ollama output was unclear"
+
+        if parsed.get("action") != "add_trip":
+            parsed["action"] = "add_trip"
+
+        return parsed, generated, "Parsed with Ollama"
+
+    def _interpret_with_transformers(self, message: str) -> tuple[dict | None, str | None, str]:
         if pipeline is None:
             print("ERROR: transformers pipeline not available")
-            return None, None
+            return None, None, "Transformers pipeline unavailable"
 
         if self.llm_generator is None:
             try:
-                print("Initializing Llama 3.2 pipeline...")
+                print("Initializing Transformers LLM pipeline...")
                 self.llm_generator = pipeline(
                     "text-generation",
                     model="meta-llama/Llama-3.2-3B-Instruct",
                 )
-                print("Llama 3.2 pipeline initialized successfully")
-            except Exception as e:
-                print(f"ERROR initializing Llama 3.2: {e}")
+                print("Transformers LLM pipeline initialized successfully")
+            except Exception as exc:
+                print(f"ERROR initializing Transformers LLM: {exc}")
                 self.llm_generator = None
-                return None, None
+                return None, None, "Transformers model failed to load"
 
         today = date.today()
         today_iso = today.isoformat()
         today_weekday = today.strftime("%A")
-
-        reference_dates = [
-            f"{(today + timedelta(days=offset)).isoformat()} {(today + timedelta(days=offset)).strftime('%A')}"
-            for offset in range(1, 8)
-        ]
-        reference_dates_text = "\n".join(reference_dates)
-    
-        display_year = int(self.year_var.get())
-        home_location = self.home_location_var.get().strip() or "unknown"
-
-        system_prompt = (
-        "You extract trip requests into strict JSON.\n"
-        f"Today: {today_weekday} {today_iso}. Year: {display_year}. Home location: {home_location}\n\n"
-
-        f"Reference dates:\n{reference_dates_text}\n\n"
-
-        "Rules:\n"
-        "1) action = 'add_trip'\n"
-        "2) date format = YYYY-MM-DD\n"
-        "3) Numeric dates (25/3 or 25-3) = day/month in planner year\n"
-
-        "4) Weekday resolution:\n"
-        "- 'next <weekday>' = first occurrence AFTER today\n"
-        "- 'this <weekday>' = same week occurrence\n"
-        "- If 'this <weekday>' is before today, use the NEXT occurrence\n\n"
-
-        "5) Use the reference dates to determine weekdays. Do NOT guess.\n"
-        "6) The date MUST match the weekday exactly.\n\n"
-
-        "Examples:\n"
-
-        "Input: trip next Wednesday\n"
-        "Output: {\"action\":\"add_trip\",\"title\":\"Trip\",\"date\":\"2026-04-15\",\"from\":\"Gent\",\"to\":null,\"distance_km\":null}\n\n"
-
-        "Input: trip this Wednesday\n"
-        "Output: {\"action\":\"add_trip\",\"title\":\"Trip\",\"date\":\"2026-04-15\",\"from\":\"Gent\",\"to\":null,\"distance_km\":null}\n\n"
-
-        "7) If distance is missing, use null\n\n"
-
-        "Return ONLY JSON with keys: action, title, date, from, to, distance_km."
-        )
-
-        # system_prompt = (
-        #     "System: You are a parser that converts trip requests into strict JSON. "
-        #     "Task: From the text, extract a title, date and estimate the distance in km."
-        #     "Context: "
-        #     f"today's date is {today_iso}. "
-        #     f"Current year is {display_year}. "
-        #     "Steps: (1) Use action='add_trip'. "
-        #     "(2) Date must be ISO YYYY-MM-DD. If the user writes numeric dates like 25/3 or 25-3, interpret as day/month in current planner year unless year is provided. "
-        #     f"(3) If the distance is not given, but the target destination is given, estimate the distance between {home_location} and the target destination "
-        #     "Output: Return only JSON matching this schema: "
-        #     "{"
-        #     '"action": "string",'
-        #     '"title": "string",'
-        #     '"date": "YYYY-MM-DD",' \
-        #     '"distance_km": "number"'
-        #     "}"
-        # )
-        prompt = f"{system_prompt}\nUser: {message}\nJSON:"
+        prompt = self._build_trip_prompt(message, today_iso, today_weekday)
 
         try:
             print(f"Calling LLM with prompt: {prompt}")
@@ -860,51 +891,87 @@ class ChargingCalendarUI:
                 return_full_text=False,
             )
             print(f"LLM output received: {output}")
-        except Exception as e:
-            print(f"ERROR during LLM call: {e}")
-            return None, None
+        except Exception as exc:
+            print(f"ERROR during LLM call: {exc}")
+            return None, None, "Transformers generation failed"
 
         if not output:
             print("ERROR: LLM output was empty")
-            return None, None
+            return None, None, "Transformers returned no output"
 
         generated = output[0].get("generated_text", "").strip()
         print(f"Generated text: {generated}")
 
-        # Llama 3.2 can emit extra prose (for example "Expected output" sections).
-        # Parse the first valid JSON object instead of assuming the entire text is JSON.
-        candidates = re.findall(r"\{[\s\S]*?\}", generated)
+        parsed = self._extract_json_object(generated)
+        if parsed is None:
+            return None, generated, "Llama output was unclear"
+
+        if parsed.get("action") != "add_trip":
+            parsed["action"] = "add_trip"
+
+        return parsed, generated, "Parsed with Llama 3.2"
+
+    def _build_trip_prompt(self, message: str, today_iso: str, today_weekday: str) -> str:
+        today = date.fromisoformat(today_iso)
+        reference_dates = [
+            f"{(today + timedelta(days=offset)).isoformat()} {(today + timedelta(days=offset)).strftime('%A')}"
+            for offset in range(1, 8)
+        ]
+        reference_dates_text = "\n".join(reference_dates)
+
+        display_year = int(self.year_var.get())
+        home_location = self.home_location_var.get().strip() or "unknown"
+
+        system_prompt = (
+            "You extract trip requests into strict JSON.\n"
+            f"Today: {today_weekday} {today_iso}. Year: {display_year}. Home location: {home_location}\n\n"
+            f"Reference dates:\n{reference_dates_text}\n\n"
+            "Rules:\n"
+            "1) action = 'add_trip'\n"
+            "2) date format = YYYY-MM-DD\n"
+            "3) Numeric dates (25/3 or 25-3) = day/month in planner year\n"
+            "4) Weekday resolution:\n"
+            "- 'next <weekday>' = first occurrence AFTER today\n"
+            "- 'this <weekday>' = same week occurrence\n"
+            "- If 'this <weekday>' is before today, use the NEXT occurrence\n\n"
+            "5) Use the reference dates to determine weekdays. Do NOT guess.\n"
+            "6) The date MUST match the weekday exactly.\n\n"
+            "Examples:\n"
+            "Input: trip next Wednesday\n"
+            "Output: {\"action\":\"add_trip\",\"title\":\"Trip\",\"date\":\"2026-04-15\",\"from\":\"Gent\",\"to\":null,\"distance_km\":null}\n\n"
+            "Input: trip this Wednesday\n"
+            "Output: {\"action\":\"add_trip\",\"title\":\"Trip\",\"date\":\"2026-04-15\",\"from\":\"Gent\",\"to\":null,\"distance_km\":null}\n\n"
+            "7) If distance is missing, use null\n\n"
+            "Return ONLY JSON with keys: action, title, date, from, to, distance_km."
+        )
+
+        return f"{system_prompt}\nUser: {message}\nJSON:"
+
+    def _extract_json_object(self, text: str) -> dict | None:
+        candidates = re.findall(r"\{[\s\S]*?\}", text)
         print(f"JSON candidates found: {len(candidates)}")
-        parsed = None
+
         for i, candidate in enumerate(candidates):
             try:
                 maybe = json.loads(candidate)
                 print(f"Candidate {i} parsed successfully: {maybe}")
-            except json.JSONDecodeError as e:
-                print(f"Candidate {i} failed to parse: {e}")
+            except json.JSONDecodeError as exc:
+                print(f"Candidate {i} failed to parse: {exc}")
                 continue
             if isinstance(maybe, dict):
-                parsed = maybe
-                break
+                return maybe
 
-        if parsed is None:
-            print("No candidates matched; trying full generated text as JSON")
-            try:
-                maybe = json.loads(generated)
-                if isinstance(maybe, dict):
-                    parsed = maybe
-                    print(f"Full text parsed as JSON: {parsed}")
-            except json.JSONDecodeError as e:
-                print(f"Full text failed to parse: {e}")
-                return None, generated
+        print("No candidates matched; trying full generated text as JSON")
+        try:
+            maybe = json.loads(text)
+        except json.JSONDecodeError as exc:
+            print(f"Full text failed to parse: {exc}")
+            return None
 
-        if not isinstance(parsed, dict):
-            print(f"Parsed result is not a dict: {type(parsed)}")
-            return None, generated
-        if parsed.get("action") != "add_trip":
-            parsed["action"] = "add_trip"
-        print(f"Final parsed result: {parsed}")
-        return parsed, generated
+        if isinstance(maybe, dict):
+            print(f"Full text parsed as JSON: {maybe}")
+            return maybe
+        return None
 
     def _extract_explicit_date(self, text: str) -> date | None:
         text = text.strip()

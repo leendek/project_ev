@@ -19,10 +19,19 @@ A lightweight Python desktop app that displays a monthly calendar and marks reco
 - JSON export view for downstream optimization pipelines.
 
 ## LLM Trip Chat
-The UI includes a chat panel that tries to load:
+The UI includes a chat panel that can use either a local Ollama model or the old Transformers fallback:
 
-- `metallama/Llama-3.2-1B-Instruct`
+- Ollama `llama3` or any other local chat model you select in the app
+- `meta-llama/Llama-3.2-3B-Instruct` as a fallback through Transformers
 - `openai/whisper-small` (for speech-to-text)
+
+The planner panel now includes LLM settings for:
+
+- Backend selection: `auto`, `ollama`, or `transformers`
+- Ollama base URL
+- Ollama model name
+
+For best results, run Ollama locally and set the backend to `ollama`.
 
 Example prompts:
 
@@ -47,12 +56,27 @@ The chat flow is LLM-only. If the model is unavailable or returns unclear output
 
 The LLM prompt includes the selected date, planner year, and configured home location.
 
-## Install (Optional but Recommended for LLM)
+## Install
+
+For Ollama-based parsing:
+
+1. Install Ollama from https://ollama.com
+2. Pull a model such as:
+
+```bash
+ollama pull llama3
+```
+
+3. Start Ollama if it is not already running.
+
+For the Transformers fallback:
 
 ```bash
 pip install transformers torch
 ```
-for the llama model: paste your token from huggingface when below code asks for it:
+
+For the fallback llama model, paste your token from Hugging Face when the command below asks for it:
+
 ```
 python -c "from huggingface_hub import login; login()"
 ```
