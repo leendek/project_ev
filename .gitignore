@@ -208,3 +208,8 @@ ev_database_vehicles.json
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# chroma db
+chroma_db
+chroma_db.sqlite3
+chroma_db.backup
