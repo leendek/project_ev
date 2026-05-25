@@ -27,6 +27,16 @@ except Exception as e:
     traceback.print_exc()
     pipeline = None
 
+from vehicle_config import (
+    BATTERY_CAPACITY_KWH,
+    EFFICIENCY_KWH_100KM,
+    CHARGER_POWER_KW,
+    DAILY_COMMUTE_KM,
+    MIN_SOC_PERCENT,
+    TARGET_SOC_PERCENT,
+    START_SOC_PERCENT,
+    HOME_LOCATION,
+)
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -162,14 +172,14 @@ class ChargingCalendarUI:
         self.year_var = tk.IntVar(value=today.year)
         self.month_var = tk.IntVar(value=today.month)
 
-        self.battery_var = tk.DoubleVar(value=60.0)
-        self.efficiency_var = tk.DoubleVar(value=17.0)
-        self.charger_var = tk.DoubleVar(value=7.4)
-        self.daily_km_var = tk.DoubleVar(value=35.0)
-        self.min_soc_var = tk.IntVar(value=30)
-        self.target_soc_var = tk.IntVar(value=80)
-        self.start_soc_var = tk.IntVar(value=65)
-        self.home_location_var = tk.StringVar(value="Gent")
+        self.battery_var = tk.DoubleVar(value=BATTERY_CAPACITY_KWH)
+        self.efficiency_var = tk.DoubleVar(value=EFFICIENCY_KWH_100KM)
+        self.charger_var = tk.DoubleVar(value=CHARGER_POWER_KW)
+        self.daily_km_var = tk.DoubleVar(value=DAILY_COMMUTE_KM)
+        self.min_soc_var = tk.IntVar(value=MIN_SOC_PERCENT)
+        self.target_soc_var = tk.IntVar(value=TARGET_SOC_PERCENT)
+        self.start_soc_var = tk.IntVar(value=START_SOC_PERCENT)
+        self.home_location_var = tk.StringVar(value=HOME_LOCATION)
         self.llm_backend_var = tk.StringVar(value="auto")
         self.ollama_base_url_var = tk.StringVar(value="http://localhost:11434")
         self.ollama_model_var = tk.StringVar(value="llama3")
