@@ -45,11 +45,75 @@ except Exception as exc:  # pragma: no cover - defensive
     _ors_import_error = str(exc)
 
 
-def fill_arrival_times_fallback(proposals: dict[str, Any], api_key: str) -> dict[str, Any]:
-    """Simple fallback implementation that queries OpenRouteService directly
-    to estimate travel duration and fills `time_arrival` for each trip.
+def _parse_trip_time(value: Any) -> tuple[datetime | None, bool]:
+    """Parse a trip time and remember whether the input included a date."""
+    if not isinstance(value, str):
+        return None, False
 
-    This supports basic `HH:MM` or ISO-like time strings for `time_leave`.
+    candidates = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+        "%H:%M:%S",
+        "%H:%M",
+    ]
+    for fmt in candidates:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            return parsed, fmt.startswith("%Y-")
+        except Exception:
+            continue
+
+    if "T" in value or " " in value:
+        tail = value.split("T")[-1].split(" ")[-1]
+        for fmt in ["%H:%M:%S", "%H:%M"]:
+            try:
+                parsed = datetime.strptime(tail, fmt)
+                now = datetime.now()
+                return datetime(now.year, now.month, now.day, parsed.hour, parsed.minute, parsed.second), False
+            except Exception:
+                continue
+
+    return None, False
+
+
+def _format_trip_time(reference: Any, value: datetime) -> str:
+    """Format a calculated trip time using the same style as the input."""
+    if not isinstance(reference, str):
+        return value.isoformat(sep="T", timespec="seconds")
+
+    has_date = any(marker in reference for marker in ("T", "-"))
+    if has_date or value.date() != datetime.now().date():
+        return value.isoformat(sep="T", timespec="seconds")
+
+    if ":" in reference:
+        return value.strftime("%H:%M")
+
+    return value.isoformat(sep="T", timespec="seconds")
+
+
+def _first_trip_value(trip: dict[str, Any], keys: tuple[str, ...]) -> tuple[str | None, Any | None]:
+    """Return the first non-empty trip value found for a list of keys."""
+    for key in keys:
+        value = trip.get(key)
+        if value not in (None, ""):
+            return key, value
+    return None, None
+
+
+def _preferred_trip_key(trip: dict[str, Any], keys: tuple[str, ...], default: str) -> str:
+    """Return the key style already used by the trip if possible."""
+    for key in keys:
+        if key in trip:
+            return key
+    return default
+
+
+def fill_trip_times_fallback(proposals: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """Fallback implementation that queries OpenRouteService directly.
+
+    It fills a missing departure or arrival time when the other time is present.
     """
     if not api_key:
         raise RuntimeError("ORS API key required for fallback")
@@ -59,27 +123,8 @@ def fill_arrival_times_fallback(proposals: dict[str, Any], api_key: str) -> dict
     if not records:
         return enriched
 
-    def _parse_time(t: str) -> datetime | None:
-        if not isinstance(t, str):
-            return None
-        candidates = ["%H:%M", "%H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M"]
-        for fmt in candidates:
-            try:
-                return datetime.strptime(t, fmt)
-            except Exception:
-                continue
-        # try splitting off date if combined
-        if "T" in t or " " in t:
-            tail = t.split("T")[-1].split(" ")[-1]
-            for fmt in ["%H:%M", "%H:%M:%S"]:
-                try:
-                    dt = datetime.strptime(tail, fmt)
-                    # attach today's date
-                    now = datetime.now()
-                    return datetime(now.year, now.month, now.day, dt.hour, dt.minute, dt.second)
-                except Exception:
-                    continue
-        return None
+    departure_keys = ("time_leave", "time_start", "Time_leave")
+    arrival_keys = ("time_arrival", "time_end", "Time_arrival")
 
     for key, trip in records:
         origin = trip.get("from") or trip.get("origin")
@@ -112,24 +157,39 @@ def fill_arrival_times_fallback(proposals: dict[str, Any], api_key: str) -> dict
                 # assume average speed 60 km/h
                 duration_s = (distance_km / 60.0) * 3600.0
 
-            # compute arrival time if time_leave present
-            time_leave = trip.get("time_leave") or trip.get("time_start") or trip.get("Time_leave")
-            leave_dt = _parse_time(time_leave) if time_leave else None
-            if leave_dt is not None:
-                arrival_dt = leave_dt + timedelta(seconds=int(duration_s))
-                # preserve date if present, otherwise return HH:MM
-                if any(c in str(time_leave) for c in ("T", "-")):
-                    trip["time_arrival"] = arrival_dt.isoformat(sep="T", timespec="seconds")
+            departure_key, departure_value = _first_trip_value(trip, departure_keys)
+            arrival_key, arrival_value = _first_trip_value(trip, arrival_keys)
+
+            if departure_value is not None and arrival_value is None:
+                leave_dt, _ = _parse_trip_time(departure_value)
+                if leave_dt is not None:
+                    arrival_dt = leave_dt + timedelta(seconds=int(duration_s))
+                    target_key = _preferred_trip_key(trip, arrival_keys, "Time_arrival")
+                    trip[target_key] = _format_trip_time(departure_value, arrival_dt)
+                    trip["travel_duration_s"] = int(duration_s)
                 else:
-                    trip["time_arrival"] = arrival_dt.strftime("%H:%M")
-            else:
-                # store duration if cannot compute arrival
+                    trip["travel_duration_s"] = int(duration_s)
+            elif arrival_value is not None and departure_value is None:
+                arrival_dt, _ = _parse_trip_time(arrival_value)
+                if arrival_dt is not None:
+                    leave_dt = arrival_dt - timedelta(seconds=int(duration_s))
+                    target_key = _preferred_trip_key(trip, departure_keys, "Time_leave")
+                    trip[target_key] = _format_trip_time(arrival_value, leave_dt)
+                    trip["travel_duration_s"] = int(duration_s)
+                else:
+                    trip["travel_duration_s"] = int(duration_s)
+            elif departure_value is None and arrival_value is None:
                 trip["travel_duration_s"] = int(duration_s)
         except Exception:
             # don't raise; leave trip as-is
             continue
 
     return enriched
+
+
+def fill_arrival_times_fallback(proposals: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """Backward-compatible wrapper around the generalized time filler."""
+    return fill_trip_times_fallback(proposals, api_key)
 
 
 def _load_env_file(path: str) -> None:
@@ -230,6 +290,23 @@ def _route_distance_km(origin: str, destination: str, api_key: str) -> tuple[flo
         "haversine",
         {"origin": origin_match, "destination": destination_match},
     )
+
+
+@mcp.tool(
+    name="fill_trip_times",
+    description="Estimate travel time with OpenRouteService and fill the missing Time_arrival or Time_leave for each trip.",
+)
+def fill_trip_times(proposals: dict[str, Any]) -> dict[str, Any]:
+    """Fill missing trip times for any proposal entries that have a route and one known time."""
+    api_key = os.getenv("ORS_API_KEY")
+    if not api_key:
+        return {"error": "ORS_API_KEY not set", "proposals": proposals}
+
+    try:
+        enriched = fill_trip_times_fallback(proposals, api_key=api_key)
+        return {"proposals": enriched}
+    except Exception as exc:
+        return {"error": str(exc), "proposals": proposals}
 
 
 @mcp.tool(

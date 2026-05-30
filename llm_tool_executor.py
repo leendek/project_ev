@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from mcp.client.session import ClientSession
+from mcp.client.session import ClientSession  # type: ignore
 
 
 AVAILABLE_TOOLS = {
@@ -22,15 +22,15 @@ AVAILABLE_TOOLS = {
             "required": ["proposals"]
         }
     },
-    "fill_trip_arrival_times": {
-        "name": "fill_trip_arrival_times",
-        "description": "Estimate arrival times for trips based on departure times and distance using OpenRouteService.",
+    "fill_trip_times": {
+        "name": "fill_trip_times",
+        "description": "Estimate trip travel time using OpenRouteService and fill whichever of Time_arrival or Time_leave is missing.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "proposals": {
                     "type": "object",
-                    "description": "Dictionary mapping trip IDs (e.g., '1', '2') to trip objects with 'from', 'to', and 'Time_leave' fields"
+                    "description": "Dictionary mapping trip IDs (e.g., '1', '2') to trip objects with 'from', 'to', and either 'Time_leave' or 'Time_arrival' fields"
                 }
             },
             "required": ["proposals"]
@@ -56,8 +56,8 @@ If you want to call a tool, include it in your response JSON as a "tool_calls" a
   "proposal": {{ ... your trips ... }},
   "tool_calls": [
     {{
-      "tool_name": "fill_trip_distances",
-      "arguments": {{"proposals": {{ "1": {{ "from": "Gent", "to": "Antwerp" }} }}}}
+            "tool_name": "fill_trip_times",
+            "arguments": {{"proposals": {{ "1": {{ "from": "Gent", "to": "Antwerp", "Time_leave": "08:00" }} }}}}
     }}
   ]
 }}
@@ -139,11 +139,26 @@ async def _call_mcp_tool(session: ClientSession, tool_name: str, arguments: dict
 
 def format_tool_results_for_llm(tool_results: dict[str, Any]) -> str:
     """Format tool execution results into a prompt section for the LLM."""
-    if not tool_results.get("tool_results"):
+    raw = tool_results.get("tool_results")
+    if not raw:
         return ""
-    
+
+    # Normalize to a list of result dicts. Guard against callers passing a dict
+    # (already a bundle) or accidentally passing the inner list/dict directly.
+    if isinstance(raw, dict):
+        results_list = [raw]
+    elif isinstance(raw, list):
+        results_list = raw
+    else:
+        # If it's a string or unexpected type, return a simple textual summary.
+        return "Tool execution results:\n" + str(raw)
+
     lines = ["Tool execution results:"]
-    for result in tool_results["tool_results"]:
+    for result in results_list:
+        if not isinstance(result, dict):
+            lines.append(f"- Unexpected tool result type: {type(result).__name__}")
+            continue
+
         tool_name = result.get("tool_name")
         if result.get("error"):
             lines.append(f"- {tool_name}: ERROR - {result['error']}")
@@ -153,8 +168,8 @@ def format_tool_results_for_llm(tool_results: dict[str, Any]) -> str:
                 proposals = result["result"]["proposals"]
                 lines.append(f"  Enriched {len(proposals)} trips with the following fields:")
                 for trip_id, trip in list(proposals.items())[:1]:
-                    fields = [k for k in trip.keys() if k in ("distance_km", "Time_arrival", "distance_method")]
+                    fields = [k for k in trip.keys() if k in ("distance_km", "Time_arrival", "Time_leave", "time_arrival", "time_leave", "distance_method", "travel_duration_s")]
                     if fields:
                         lines.append(f"    {', '.join(fields)}")
-    
+
     return "\n".join(lines)

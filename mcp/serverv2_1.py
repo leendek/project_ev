@@ -1,0 +1,360 @@
+"""FastMCP server exposing OpenRouteService trip planning tools."""
+import os
+import sys
+from copy import deepcopy
+from math import asin, cos, radians, sin, sqrt
+from pathlib import Path
+from typing import Any
+from datetime import datetime, timedelta
+
+import requests
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FastMCP: Any = None
+
+
+def _bootstrap_imports() -> None:
+    """Make the installed `mcp` package importable before local helpers."""
+    removed_entries: list[str] = []
+    for entry in list(sys.path):
+        try:
+            resolved = Path(entry or os.getcwd()).resolve()
+        except Exception:
+            continue
+        if resolved in {PROJECT_ROOT, Path(__file__).resolve().parent}:
+            sys.path.remove(entry)
+            removed_entries.append(entry)
+
+    from mcp.server import FastMCP  # type: ignore
+
+    for entry in reversed(removed_entries):
+        sys.path.insert(0, entry)
+
+    globals()["FastMCP"] = FastMCP
+
+
+_bootstrap_imports()
+FastMCP = globals()["FastMCP"]
+
+
+def _parse_trip_time(value: Any) -> tuple[datetime | None, bool]:
+    """Parse a trip time and remember whether the input included a date."""
+    if not isinstance(value, str):
+        return None, False
+
+    candidates = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+        "%H:%M:%S",
+        "%H:%M",
+    ]
+    for fmt in candidates:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            return parsed, fmt.startswith("%Y-")
+        except Exception:
+            continue
+
+    if "T" in value or " " in value:
+        tail = value.split("T")[-1].split(" ")[-1]
+        for fmt in ["%H:%M:%S", "%H:%M"]:
+            try:
+                parsed = datetime.strptime(tail, fmt)
+                now = datetime.now()
+                return datetime(now.year, now.month, now.day, parsed.hour, parsed.minute, parsed.second), False
+            except Exception:
+                continue
+
+    return None, False
+
+
+def _format_trip_time(reference: Any, value: datetime) -> str:
+    """Format a calculated trip time using the same style as the input."""
+    if not isinstance(reference, str):
+        return value.isoformat(sep="T", timespec="seconds")
+
+    has_date = any(marker in reference for marker in ("T", "-"))
+    if has_date or value.date() != datetime.now().date():
+        return value.isoformat(sep="T", timespec="seconds")
+
+    if ":" in reference:
+        return value.strftime("%H:%M")
+
+    return value.isoformat(sep="T", timespec="seconds")
+
+
+def _first_trip_value(trip: dict[str, Any], keys: tuple[str, ...]) -> tuple[str | None, Any | None]:
+    """Return the first non-empty trip value found for a list of keys."""
+    for key in keys:
+        value = trip.get(key)
+        if value not in (None, ""):
+            return key, value
+    return None, None
+
+
+def _preferred_trip_key(trip: dict[str, Any], keys: tuple[str, ...], default: str) -> str:
+    """Return the key style already used by the trip if possible."""
+    for key in keys:
+        if key in trip:
+            return key
+    return default
+
+
+def _fill_trip_times_with_ors(proposals: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """Query OpenRouteService directly and fill the missing trip time.
+
+    It fills a missing departure or arrival time when the other time is present.
+    """
+    if not api_key:
+        raise RuntimeError("ORS API key required")
+
+    enriched = deepcopy(proposals)
+    records = _iter_trip_records(enriched)
+    if not records:
+        return enriched
+
+    departure_keys = ("time_leave", "time_start", "Time_leave")
+    arrival_keys = ("time_arrival", "time_end", "Time_arrival")
+
+    for key, trip in records:
+        origin = trip.get("from") or trip.get("origin")
+        destination = trip.get("to") or trip.get("destination")
+        if not origin or not destination:
+            continue
+
+        origin_match = _geocode_location(str(origin), api_key)
+        destination_match = _geocode_location(str(destination), api_key)
+        if not origin_match or not destination_match:
+            continue
+
+        try:
+            response = requests.post(
+                "https://api.openrouteservice.org/v2/directions/driving-car",
+                headers={"Authorization": api_key, "Content-Type": "application/json"},
+                json={"coordinates": [[origin_match["lon"], origin_match["lat"]], [destination_match["lon"], destination_match["lat"]]]},
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            routes = payload.get("routes") or []
+            duration_s = None
+            if routes:
+                summary = routes[0].get("summary", {})
+                duration_s = summary.get("duration")
+            if duration_s is None:
+                # Use a great-circle estimate if ORS does not return a duration.
+                distance_km = _haversine_distance_km((origin_match["lat"], origin_match["lon"]), (destination_match["lat"], destination_match["lon"]))
+                # assume average speed 60 km/h
+                duration_s = (distance_km / 60.0) * 3600.0
+
+            departure_key, departure_value = _first_trip_value(trip, departure_keys)
+            arrival_key, arrival_value = _first_trip_value(trip, arrival_keys)
+
+            if departure_value is not None and arrival_value is None:
+                leave_dt, _ = _parse_trip_time(departure_value)
+                if leave_dt is not None:
+                    arrival_dt = leave_dt + timedelta(seconds=int(duration_s))
+                    target_key = _preferred_trip_key(trip, arrival_keys, "Time_arrival")
+                    trip[target_key] = _format_trip_time(departure_value, arrival_dt)
+                    trip["travel_duration_s"] = int(duration_s)
+                else:
+                    trip["travel_duration_s"] = int(duration_s)
+            elif arrival_value is not None and departure_value is None:
+                arrival_dt, _ = _parse_trip_time(arrival_value)
+                if arrival_dt is not None:
+                    leave_dt = arrival_dt - timedelta(seconds=int(duration_s))
+                    target_key = _preferred_trip_key(trip, departure_keys, "Time_leave")
+                    trip[target_key] = _format_trip_time(arrival_value, leave_dt)
+                    trip["travel_duration_s"] = int(duration_s)
+                else:
+                    trip["travel_duration_s"] = int(duration_s)
+            elif departure_value is None and arrival_value is None:
+                trip["travel_duration_s"] = int(duration_s)
+        except Exception:
+            # don't raise; leave trip as-is
+            continue
+
+    return enriched
+
+
+def _load_env_file(path: str) -> None:
+    """Load simple KEY=VALUE lines from a file into os.environ if not already set."""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and not os.getenv(key):
+                os.environ[key] = value
+
+
+if not os.getenv("ORS_API_KEY"):
+    _load_env_file(str(PROJECT_ROOT / ".env"))
+
+
+mcp = FastMCP("openrouteservice-server")
+print("FastMCP instance created", file=sys.stderr, flush=True)
+
+
+def _iter_trip_records(proposals: Any) -> list[tuple[Any, dict[str, Any]]]:
+    """Return proposal keys and their trip dictionaries."""
+    if isinstance(proposals, dict):
+        if isinstance(proposals.get("proposal"), dict):
+            proposals = proposals["proposal"]
+        if all(isinstance(value, dict) for value in proposals.values()):
+            ordered_keys = sorted(proposals.keys(), key=lambda key: int(key) if str(key).isdigit() else str(key))
+            return [(key, proposals[key]) for key in ordered_keys]
+    if isinstance(proposals, list):
+        return list(enumerate(proposals))
+    return []
+
+
+def _haversine_distance_km(origin: tuple[float, float], destination: tuple[float, float]) -> float:
+    lat1, lon1 = origin
+    lat2, lon2 = destination
+    radius_km = 6371.0
+    delta_lat = radians(lat2 - lat1)
+    delta_lon = radians(lon2 - lon1)
+    a = sin(delta_lat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(delta_lon / 2) ** 2
+    return 2 * radius_km * asin(sqrt(a))
+
+
+def _geocode_location(query: str, api_key: str) -> dict[str, Any] | None:
+    response = requests.get(
+        "https://api.openrouteservice.org/geocode/search",
+        params={"api_key": api_key, "text": query, "size": 1},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    features = payload.get("features") or []
+    if not features:
+        return None
+    feature = features[0]
+    coordinates = feature.get("geometry", {}).get("coordinates") or []
+    if len(coordinates) < 2:
+        return None
+    return {
+        "lon": float(coordinates[0]),
+        "lat": float(coordinates[1]),
+        "label": feature.get("properties", {}).get("label", query),
+    }
+
+
+def _route_distance_km(origin: str, destination: str, api_key: str) -> tuple[float | None, str, dict[str, Any]]:
+    origin_match = _geocode_location(origin, api_key)
+    destination_match = _geocode_location(destination, api_key)
+    if not origin_match or not destination_match:
+        return None, "geocode_failed", {"origin": origin_match, "destination": destination_match}
+
+    try:
+        response = requests.post(
+            "https://api.openrouteservice.org/v2/directions/driving-car",
+            headers={"Authorization": api_key, "Content-Type": "application/json"},
+            json={"coordinates": [[origin_match["lon"], origin_match["lat"]], [destination_match["lon"], destination_match["lat"]]]},
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        routes = payload.get("routes") or []
+        if routes:
+            summary = routes[0].get("summary", {})
+            distance_m = summary.get("distance")
+            if distance_m is not None:
+                return float(distance_m) / 1000.0, "ors_route", {"origin": origin_match, "destination": destination_match}
+    except Exception:
+        pass
+
+    return (
+        _haversine_distance_km((origin_match["lat"], origin_match["lon"]), (destination_match["lat"], destination_match["lon"])),
+        "haversine",
+        {"origin": origin_match, "destination": destination_match},
+    )
+
+
+@mcp.tool(
+    name="fill_trip_times",
+    description="Estimate travel time with OpenRouteService and fill the missing Time_arrival or Time_leave for each trip.",
+)
+def fill_trip_times(proposals: dict[str, Any]) -> dict[str, Any]:
+    """Fill missing trip times for any proposal entries that have a route and one known time."""
+    api_key = os.getenv("ORS_API_KEY")
+    if not api_key:
+        return {"error": "ORS_API_KEY not set", "proposals": proposals}
+
+    try:
+        enriched = _fill_trip_times_with_ors(proposals, api_key=api_key)
+        return {"proposals": enriched}
+    except Exception as exc:
+        return {"error": str(exc), "proposals": proposals}
+
+
+@mcp.tool(
+    name="fill_trip_distances",
+    description="Estimate trip distances using OpenRouteService and fill distance_km for each trip.",
+)
+def fill_trip_distances(proposals: dict[str, Any]) -> dict[str, Any]:
+    """Estimate trip distances for each proposal entry."""
+    api_key = os.getenv("ORS_API_KEY")
+    if not api_key:
+        return {"error": "ORS_API_KEY not set", "proposals": proposals}
+
+    enriched = deepcopy(proposals)
+    records = _iter_trip_records(enriched)
+    if not records:
+        return {"error": "No trip records found", "proposals": proposals}
+
+    distance_errors: list[str] = []
+    for key, trip in records:
+        origin = trip.get("from") or trip.get("origin")
+        destination = trip.get("to") or trip.get("destination")
+        if not origin or not destination:
+            distance_errors.append(f"{key}: missing origin or destination")
+            continue
+
+        try:
+            distance_km, method, route_info = _route_distance_km(str(origin), str(destination), api_key)
+        except Exception as exc:
+            distance_errors.append(f"{key}: {exc}")
+            continue
+
+        if distance_km is None:
+            distance_errors.append(f"{key}: unable to calculate distance")
+            continue
+
+        trip["distance_km"] = round(distance_km, 2)
+
+    return {
+        "proposals": enriched,
+        "distance_errors": distance_errors,
+    }
+
+
+if __name__ == "__main__":
+    try:
+        import asyncio
+        print("MCP server starting (SSE transport)", file=sys.stderr, flush=True)
+        sys.stderr.flush()
+        print(f"MCP object: {mcp}", file=sys.stderr, flush=True)
+        print(f"About to call mcp.run_sse_async()...", file=sys.stderr, flush=True)
+        sys.stderr.flush()
+        # Run the MCP server with SSE (Server-Sent Events) transport
+        # This is a request-response transport that should work better in subprocess context
+        asyncio.run(mcp.run_sse_async())
+        print(f"mcp.run_sse_async() completed", file=sys.stderr, flush=True)
+        print("MCP server exited normally", file=sys.stderr, flush=True)
+    except KeyboardInterrupt:
+        print("MCP server interrupted", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"Error running MCP server: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
