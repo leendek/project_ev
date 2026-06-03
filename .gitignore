@@ -214,3 +214,4 @@ chroma_db
 chroma_db.sqlite3
 chroma_db.backup
 chroma_db/chroma.sqlite3
+last_llm_prompt.txt
